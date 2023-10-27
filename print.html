@@ -355,8 +355,281 @@ This block is marked as soft-confirmed by the validating full node until the sam
 <div style="break-before: page; page-break-before: always;"></div><h1 id="mempool"><a class="header" href="#mempool">Mempool</a></h1>
 <div style="break-before: page; page-break-before: always;"></div><h1 id="node"><a class="header" href="#node">Node</a></h1>
 <div style="break-before: page; page-break-before: always;"></div><h1 id="p2p"><a class="header" href="#p2p">P2P</a></h1>
-<div style="break-before: page; page-break-before: always;"></div><h1 id="state"><a class="header" href="#state">State</a></h1>
+<p>Every rollup node (both full and light) runs a P2P client using <a href="https://github.com/libp2p/go-libp2p">go-libp2p</a> P2P networking stack for gossiping transactions in the rollup's P2P network. The same P2P client is also used by the header and block sync services for gossiping headers and blocks.</p>
+<p>Following parameters are required for creating a new instance of a P2P client:</p>
+<ul>
+<li>P2PConfig (described below)</li>
+<li><a href="https://github.com/libp2p/go-libp2p">go-libp2p</a> private key used to create a libp2p connection and join the p2p network.</li>
+<li>chainID: rollup identifier used as namespace within the p2p network for peer discovery. The namespace acts as a sub network in the p2p network, where peer connections are limited to the same namespace.</li>
+<li>datastore: an instance of <a href="https://github.com/ipfs/go-datastore">go-datastore</a> used for creating a connection gator and stores blocked and allowed peers.</li>
+<li>logger</li>
+</ul>
+<pre><code class="language-go">// P2PConfig stores configuration related to peer-to-peer networking.
+type P2PConfig struct {
+	ListenAddress string // Address to listen for incoming connections
+	Seeds         string // Comma separated list of seed nodes to connect to
+	BlockedPeers  string // Comma separated list of nodes to ignore
+	AllowedPeers  string // Comma separated list of nodes to whitelist
+}
+</code></pre>
+<p>A P2P client also instantiates a <a href="https://github.com/libp2p/go-libp2p/tree/master/p2p/net/conngater">connection gator</a> to block and allow peers specified in the <code>P2PConfig</code>.</p>
+<p>It also sets up a gossiper using the gossip topic <code>&lt;chainID&gt;+&lt;txTopicSuffix&gt;</code> (<code>txTopicSuffix</code> is defined in <a href="https://github.com/rollkit/rollkit/blob/main/p2p/client.go#L43">p2p/client.go</a>), a Distributed Hash Table (DHT) using the <code>Seeds</code> defined in the <code>P2PConfig</code> and peer discovery using go-libp2p's <code>discovery.RoutingDiscovery</code>.</p>
+<p>A P2P client provides an interface <code>SetTxValidator(p2p.GossipValidator)</code> for specifying a gossip validator which can define how to handle the incoming <code>GossipMessage</code> in the P2P network. The <code>GossipMessage</code> represents message gossiped via P2P network (e.g. transaction, Block etc).</p>
+<pre><code class="language-go">// GossipValidator is a callback function type.
+type GossipValidator func(*GossipMessage) bool
+</code></pre>
+<p>The full nodes define a transaction validator (shown below) as gossip validator for processing the gossiped transactions to add to the mempool, whereas light nodes simply pass a dummy validator as light nodes do not process gossiped transactions.</p>
+<pre><code class="language-go">// newTxValidator creates a pubsub validator that uses the node's mempool to check the
+// transaction. If the transaction is valid, then it is added to the mempool
+func (n *FullNode) newTxValidator() p2p.GossipValidator {
+</code></pre>
+<pre><code class="language-go">// Dummy validator that always returns a callback function with boolean `false`
+func (ln *LightNode) falseValidator() p2p.GossipValidator {
+</code></pre>
+<h2 id="references-2"><a class="header" href="#references-2">References</a></h2>
+<p>[1] <a href="https://github.com/rollkit/rollkit/blob/main/p2p/client.go#L43">client.go</a></p>
+<p>[2] <a href="https://github.com/ipfs/go-datastore">go-datastore</a></p>
+<p>[3] <a href="https://github.com/libp2p/go-libp2p">go-libp2p</a></p>
+<p>[4] <a href="https://github.com/libp2p/go-libp2p/tree/master/p2p/net/conngater">conngater</a></p>
+<div style="break-before: page; page-break-before: always;"></div><h1 id="block-executor"><a class="header" href="#block-executor">Block Executor</a></h1>
+<h2 id="abstract-2"><a class="header" href="#abstract-2">Abstract</a></h2>
+<p>The <code>BlockExecutor</code> is a component responsible for creating, applying, and maintaining blocks and state in the system. It interacts with the mempool and the application via the <a href="https://github.com/cometbft/cometbft/blob/main/spec/abci/abci%2B%2B_basic_concepts.md">ABCI interface</a>.</p>
+<h2 id="detailed-description"><a class="header" href="#detailed-description">Detailed Description</a></h2>
+<p>The <code>BlockExecutor</code> is initialized with a proposer address, <code>namespace ID</code>, <code>chain ID</code>, <code>mempool</code>, <code>proxyApp</code>, <code>eventBus</code>, and <code>logger</code>. It uses these to manage the creation and application of blocks. It also validates blocks and commits them, updating the state as necessary.</p>
+<ul>
+<li>
+<p><code>NewBlockExecutor</code>: This method creates a new instance of <code>BlockExecutor</code>. It takes a proposer address, <code>namespace ID</code>, <code>chain ID</code>, <code>mempool</code>, <code>proxyApp</code>, <code>eventBus</code>, and <code>logger</code> as parameters. See <a href="https://github.com/rollkit/rollkit/blob/v0.11.x/block/block-manager.md">block manager</a> for details.</p>
+</li>
+<li>
+<p><code>InitChain</code>: This method initializes the chain by calling ABCI <code>InitChainSync</code> using the consensus connection to the app. It takes a <code>GenesisDoc</code> as a parameter. It sends a ABCI <code>RequestInitChain</code> message with the genesis parameters including:</p>
+<ul>
+<li>Genesis Time</li>
+<li>Chain ID</li>
+<li>Consensus Parameters including:
+<ul>
+<li>Block Max Bytes</li>
+<li>Block Max Gas</li>
+<li>Evidence Parameters</li>
+<li>Validator Parameters</li>
+<li>Version Parameters</li>
+</ul>
+</li>
+<li>Initial Validator Set using genesis validators</li>
+<li>Initial Height</li>
+</ul>
+</li>
+<li>
+<p><code>CreateBlock</code>: This method reaps transactions from the mempool and builds a block. It takes the state, the height of the block, last header hash, and the commit as parameters.</p>
+</li>
+<li>
+<p><code>ApplyBlock</code>: This method applies the block to the state. Given the current state and block to be applied, it:</p>
+<ul>
+<li>
+<p>Validates the block, as described in <code>Validate</code>.</p>
+</li>
+<li>
+<p>Executes the block using app, as described in <code>execute</code>.</p>
+</li>
+<li>
+<p>Captures the validator updates done in the execute block.</p>
+</li>
+<li>
+<p>Updates the state using the block, block execution responses, and validator updates as described in <code>updateState</code>.</p>
+</li>
+<li>
+<p>Returns the updated state, validator updates and errors, if any, after applying the block.</p>
+</li>
+<li>
+<p>It can return the following named errors:</p>
+<ul>
+<li><code>ErrEmptyValSetGenerate</code>: returned when applying the validator changes would result in empty set.</li>
+<li><code>ErrAddingValidatorToBased</code>: returned when adding validators to empty validator set.</li>
+</ul>
+</li>
+</ul>
+</li>
+<li>
+<p><code>Validate</code>: This method validates the block. It takes the state and the block as parameters. In addition to the basic <a href="https://github.com/rollkit/rollkit/blob/v0.11.x/types/block_spec.md">block validation</a> rules, it applies the following validations:</p>
+<ul>
+<li>New block version must match block version of the state.</li>
+<li>If state is at genesis, new block height must match initial height of the state.</li>
+<li>New block height must be last block height + 1 of the state.</li>
+<li>New block header <code>AppHash</code> must match state <code>AppHash</code>.</li>
+<li>New block header <code>LastResultsHash</code> must match state <code>LastResultsHash</code>.</li>
+<li>New block header <code>AggregatorsHash</code> must match state <code>Validators.Hash()</code>.</li>
+</ul>
+</li>
+<li>
+<p><code>Commit</code>: This method commits the block and updates the mempool. Given the updated state, the block, and the ABCI <code>ResponseFinalizeBlock</code> as parameters, it:</p>
+<ul>
+<li>Invokes app commit, basically finalizing the last execution, by  calling ABCI <code>Commit</code>.</li>
+<li>Updates the mempool to inform that the transactions included in the block can be safely discarded.</li>
+<li>Publishes the events produced during the block exection for indexing.</li>
+</ul>
+</li>
+<li>
+<p><code>updateState</code>: This method updates the state. Given the current state, the block, the ABCI <code>ResponseFinalizeBlock</code> and the validator updates, it validates the updated validator set, updates the state by applying the block and returns the updated state and errors, if any. The state consists of:</p>
+<ul>
+<li>Version</li>
+<li>Chain ID</li>
+<li>Initial Height</li>
+<li>Last Block including:
+<ul>
+<li>Block Height</li>
+<li>Block Time</li>
+<li>Block ID</li>
+</ul>
+</li>
+<li>Next Validator Set</li>
+<li>Current Validator Set</li>
+<li>Last Validators</li>
+<li>Whether Last Height Validators changed</li>
+<li>Consensus Parameters</li>
+<li>Whether Last Height Consensus Parameters changed</li>
+<li>App Hash</li>
+</ul>
+</li>
+<li>
+<p><code>execute</code>: This method executes the block. It takes the context, the state, and the block as parameters. It calls the ABCI method <code>FinalizeBlock</code> with the ABCI <code>RequestFinalizeBlock</code> containing the block hash, ABCI header, commit, transactions and returns the ABCI <code>ResponseFinalizeBlock</code> and errors, if any.</p>
+</li>
+<li>
+<p><code>publishEvents</code>: This method publishes events related to the block. It takes the ABCI <code>ResponseFinalizeBlock</code>, the block, and the state as parameters.</p>
+</li>
+</ul>
+<h2 id="message-structurecommunication-format-2"><a class="header" href="#message-structurecommunication-format-2">Message Structure/Communication Format</a></h2>
+<p>The <code>BlockExecutor</code> communicates with the application via the <a href="https://github.com/cometbft/cometbft/blob/main/spec/abci/abci%2B%2B_basic_concepts.md">ABCI interface</a>. It calls the ABCI methods <code>InitChainSync</code>, <code>FinalizeBlock</code>, <code>Commit</code> for initializing a new chain and creating blocks, respectively.</p>
+<h2 id="assumptions-and-considerations-2"><a class="header" href="#assumptions-and-considerations-2">Assumptions and Considerations</a></h2>
+<p>The <code>BlockExecutor</code> assumes that there is consensus connection available to the app, which can be used to send and receive ABCI messages. In addition there are some important pre-condition and post-condition invariants, as follows:</p>
+<ul>
+<li>
+<p><code>InitChain</code>:</p>
+<ul>
+<li>pre-condition:
+<ul>
+<li>state is at genesis.</li>
+</ul>
+</li>
+<li>post-condition:
+<ul>
+<li>new chain is initialized.</li>
+</ul>
+</li>
+</ul>
+</li>
+<li>
+<p><code>CreateBlock</code>:</p>
+<ul>
+<li>pre-condition:
+<ul>
+<li>chain is initialized</li>
+</ul>
+</li>
+<li>post-condition:
+<ul>
+<li>new block is created</li>
+</ul>
+</li>
+</ul>
+</li>
+<li>
+<p><code>ApplyBlock</code>:</p>
+<ul>
+<li>pre-condition:
+<ul>
+<li>block is valid, using basic <a href="https://github.com/rollkit/rollkit/blob/v0.11.x/types/block_spec.md">block validation</a> rules as well as validations performed in <code>Validate</code>, as described above.</li>
+</ul>
+</li>
+<li>post-condition:
+<ul>
+<li>block is added to the chain, state is updated and block execution responses are captured.</li>
+</ul>
+</li>
+</ul>
+</li>
+<li>
+<p><code>Commit</code>:</p>
+<ul>
+<li>pre-condition:
+<ul>
+<li>block has been applied</li>
+</ul>
+</li>
+<li>post-condition:
+<ul>
+<li>block is commited</li>
+<li>mempool is cleared of block transactions</li>
+<li>block events are published</li>
+<li>state App Hash is updated with the result from <code>ResponseCommit</code></li>
+</ul>
+</li>
+</ul>
+</li>
+</ul>
+<h2 id="implementation-2"><a class="header" href="#implementation-2">Implementation</a></h2>
+<p>See <a href="https://github.com/rollkit/rollkit/blob/v0.11.x/state/executor.go">block executor</a></p>
+<h2 id="references-3"><a class="header" href="#references-3">References</a></h2>
+<p>[1] <a href="https://github.com/rollkit/rollkit/blob/v0.11.x/state/executor.go">Block Executor</a></p>
+<p>[2] <a href="https://github.com/rollkit/rollkit/blob/v0.11.x/block/block-manager.md">Block Manager</a></p>
+<p>[3] <a href="https://github.com/rollkit/rollkit/blob/v0.11.x/types/block_spec.md">Block Validation</a></p>
+<p>[4] <a href="https://github.com/cometbft/cometbft/blob/main/spec/abci/abci%2B%2B_basic_concepts.md">ABCI documentation</a></p>
 <div style="break-before: page; page-break-before: always;"></div><h1 id="store"><a class="header" href="#store">Store</a></h1>
+<h2 id="abstract-3"><a class="header" href="#abstract-3">Abstract</a></h2>
+<p>The Store interface defines methods for storing and retrieving blocks, commits, and the state of the blockchain.</p>
+<h2 id="protocolcomponent-description-2"><a class="header" href="#protocolcomponent-description-2">Protocol/Component Description</a></h2>
+<p>The Store interface defines the following methods:</p>
+<ul>
+<li><code>Height</code>: Returns the height of the highest block in the store.</li>
+<li><code>SetHeight</code>: Sets given height in the store if it's higher than the existing height in the store.</li>
+<li><code>SaveBlock</code>: Saves a block along with its seen commit.</li>
+<li><code>LoadBlock</code>: Returns a block at a given height.</li>
+<li><code>LoadBlockByHash</code>: Returns a block with a given block header hash.</li>
+<li><code>SaveBlockResponses</code>: Saves block responses in the Store.</li>
+<li><code>LoadBlockResponses</code>: Returns block results at a given height.</li>
+<li><code>LoadCommit</code>: Returns a commit for a block at a given height.</li>
+<li><code>LoadCommitByHash</code>: Returns a commit for a block with a given block header hash.</li>
+<li><code>UpdateState</code>: Updates the state saved in the Store. Only one State is stored.</li>
+<li><code>LoadState</code>: Returns the last state saved with UpdateState.</li>
+<li><code>SaveValidators</code>: Saves the validator set at a given height.</li>
+<li><code>LoadValidators</code>: Returns the validator set at a given height.</li>
+</ul>
+<p>The <code>TxnDatastore</code> interface inside <a href="https://github.com/ipfs/go-datastore">go-datastore</a> is used for constructing different key-value stores for the underlying storage of a full node. The are two different implementations of <code>TxnDatastore</code> in <a href="https://github.com/rollkit/rollkit/blob/main/store/kv.go">kv.go</a>:</p>
+<ul>
+<li>
+<p><code>NewDefaultInMemoryKVStore</code>: Builds a key-value store that uses the <a href="https://github.com/dgraph-io/badger">BadgerDB</a> library and operates in-memory, without accessing the disk. Used only across unit tests and integration tests.</p>
+</li>
+<li>
+<p><code>NewDefaultKVStore</code>: Builds a key-value store that uses the <a href="https://github.com/dgraph-io/badger">BadgerDB</a> library and stores the data on disk at the specified path.</p>
+</li>
+</ul>
+<p>A Rollkit full node is <a href="https://github.com/rollkit/rollkit/blob/main/node/full.go#L106">initialized</a> using <code>NewDefaultKVStore</code> as the base key-value store for underlying storage. To store various types of data in this base key-value store, different prefixes are used: <code>mainPrefix</code>, <code>dalcPrefix</code>, and <code>indexerPrefix</code>. The <code>mainPrefix</code> equal to <code>0</code> is used for the main node data, <code>dalcPrefix</code> equal to <code>1</code> is used for Data Availability Layer Client (DALC) data, and <code>indexerPrefix</code> equal to <code>2</code> is used for indexing related data.</p>
+<p>For the main node data, <code>DefaultStore</code> struct, an implementation of the Store interface, is used with the following prefixes for various types of data within it:</p>
+<ul>
+<li><code>blockPrefix</code> with value &quot;b&quot;: Used to store blocks in the key-value store.</li>
+<li><code>indexPrefix</code> with value &quot;i&quot;: Used to index the blocks stored in the key-value store.</li>
+<li><code>commitPrefix</code> with value &quot;c&quot;: Used to store commits related to the blocks.</li>
+<li><code>statePrefix</code> with value &quot;s&quot;: Used to store the state of the blockchain.</li>
+<li><code>responsesPrefix</code> with value &quot;r&quot;: Used to store responses related to the blocks.</li>
+<li><code>validatorsPrefix</code> with value &quot;v&quot;: Used to store validator sets at a given height.</li>
+</ul>
+<p>For example, in a call to <code>LoadBlockByHash</code> for some block hash <code>&lt;block_hash&gt;</code>, the key used in the full node's base key-value store will be <code>/0/b/&lt;block_hash&gt;</code> where <code>0</code> is the main store prefix and <code>b</code> is the block prefix. Similarly, in a call to <code>LoadValidators</code> for some height <code>&lt;height&gt;</code>, the key used in the full node's base key-value store will be <code>/0/v/&lt;height&gt;</code> where <code>0</code> is the main store prefix and <code>v</code> is the validator set prefix.</p>
+<p>Inside the key-value store, the value of these various types of data like <code>Block</code>, <code>Commit</code>, etc is stored as a byte array which is encoded and decoded using the corresponding Protobuf <a href="https://github.com/rollkit/rollkit/blob/main/types/serialization.go">marshal and unmarshal methods</a>.</p>
+<p>The store is most widely used inside the <a href="https://github.com/rollkit/rollkit/blob/main/block/manager.go">block manager</a> and <a href="https://github.com/rollkit/rollkit/blob/main/node/full_client.go">full client</a> to perform their functions correctly. Within the block manager, since it has multiple go-routines in it, it is protected by a mutex lock, <code>lastStateMtx</code>, to synchronize read/write access to it and prevent race conditions.</p>
+<h2 id="message-structurecommunication-format-3"><a class="header" href="#message-structurecommunication-format-3">Message Structure/Communication Format</a></h2>
+<p>The Store does not communicate over the network, so there is no message structure or communication format.</p>
+<h2 id="assumptions-and-considerations-3"><a class="header" href="#assumptions-and-considerations-3">Assumptions and Considerations</a></h2>
+<p>The Store assumes that the underlying datastore is reliable and provides atomicity for transactions. It also assumes that the data passed to it for storage is valid and correctly formatted.</p>
+<h2 id="implementation-3"><a class="header" href="#implementation-3">Implementation</a></h2>
+<p>See <a href="https://github.com/rollkit/rollkit/blob/main/store/types.go#L11">Store Interface</a> and <a href="https://github.com/rollkit/rollkit/blob/main/store/store.go">Default Store</a> for its implementation.</p>
+<h2 id="references-4"><a class="header" href="#references-4">References</a></h2>
+<p>[1] <a href="https://github.com/rollkit/rollkit/blob/main/store/types.go#L11">Store Interface</a></p>
+<p>[2] <a href="https://github.com/rollkit/rollkit/blob/main/store/store.go">Default Store</a></p>
+<p>[3] <a href="https://github.com/rollkit/rollkit/blob/main/node/full.go#L106">Full Node Store Initialization</a></p>
+<p>[4] <a href="https://github.com/rollkit/rollkit/blob/main/block/manager.go">Block Manager</a></p>
+<p>[5] <a href="https://github.com/rollkit/rollkit/blob/main/node/full_client.go">Full Client</a></p>
+<p>[6] <a href="https://github.com/dgraph-io/badger">Badger DB</a></p>
+<p>[7] <a href="https://github.com/ipfs/go-datastore">Go Datastore</a></p>
+<p>[8] <a href="https://github.com/rollkit/rollkit/blob/main/store/kv.go">Key Value Store</a></p>
+<p>[9] <a href="https://github.com/rollkit/rollkit/blob/main/types/serialization.go">Serialization</a></p>
 
                     </main>
 

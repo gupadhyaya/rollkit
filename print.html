@@ -274,13 +274,19 @@ gantt
 <tr><td>BlockTime</td><td>time.Duration</td><td>time interval used for block production and block retrieval from block store (<a href="https://github.com/rollkit/rollkit/blob/main/block/manager.go#L36"><code>defaultBlockTime</code></a>)</td></tr>
 <tr><td>DABlockTime</td><td>time.Duration</td><td>time interval used for both block publication to DA network and block retrieval from DA network (<a href="https://github.com/rollkit/rollkit/blob/main/block/manager.go#L33"><code>defaultDABlockTime</code></a>)</td></tr>
 <tr><td>DAStartHeight</td><td>uint64</td><td>block retrieval from DA network starts from this height</td></tr>
-<tr><td>LazyBlockTime</td><td>time.Duration</td><td>time interval used for block production in lazy aggregator mode even when there are no transactions (<a href="https://github.com/rollkit/rollkit/blob/main/block/manager.go#L39"><code>defaultLazyBlockTime</code></a>)</td></tr>
+<tr><td>LazyBlockInterval</td><td>time.Duration</td><td>time interval used for block production in lazy aggregator mode even when there are no transactions (<a href="https://github.com/rollkit/rollkit/blob/main/block/manager.go#L39"><code>defaultLazyBlockTime</code></a>)</td></tr>
+<tr><td>LazyMode</td><td>bool</td><td>when set to true, enables lazy aggregation mode which produces blocks only when transactions are available or at LazyBlockInterval intervals</td></tr>
 </tbody></table>
 </div>
 <h3 id="block-production"><a class="header" href="#block-production">Block Production</a></h3>
 <p>When the full node is operating as a sequencer (aka aggregator), the block manager runs the block production logic. There are two modes of block production, which can be specified in the block manager configurations: <code>normal</code> and <code>lazy</code>.</p>
 <p>In <code>normal</code> mode, the block manager runs a timer, which is set to the <code>BlockTime</code> configuration parameter, and continuously produces blocks at <code>BlockTime</code> intervals.</p>
-<p>In <code>lazy</code> mode, the block manager starts building a block when any transaction becomes available in the mempool. After the first notification of the transaction availability, the manager will wait for a 1 second timer to finish, in order to collect as many transactions from the mempool as possible. The 1 second delay is chosen in accordance with the default block time of 1s. The block manager also notifies the full node after every lazy block building.</p>
+<p>In <code>lazy</code> mode, the block manager implements a dual timer mechanism:</p>
+<ol>
+<li>A <code>blockTimer</code> that triggers block production at regular intervals when transactions are available</li>
+<li>A <code>lazyTimer</code> that ensures blocks are produced at <code>LazyBlockInterval</code> intervals even during periods of inactivity</li>
+</ol>
+<p>The block manager starts building a block when any transaction becomes available in the mempool via a notification channel (<code>txNotifyCh</code>). When the <code>Reaper</code> detects new transactions, it calls <code>Manager.NotifyNewTransactions()</code>, which performs a non-blocking signal on this channel. The block manager also produces empty blocks at regular intervals to maintain consistency with the DA layer, ensuring a 1:1 mapping between DA layer blocks and execution layer blocks.</p>
 <h4 id="building-the-block"><a class="header" href="#building-the-block">Building the Block</a></h4>
 <p>The block manager of the sequencer nodes performs the following steps to produce a block:</p>
 <ul>
@@ -341,13 +347,22 @@ This block is marked as soft confirmed by the validating full node until the sam
 <li>The block manager loads the initial state from the local store and uses genesis if not found in the local store, when the node (re)starts.</li>
 <li>The default mode for sequencer nodes is normal (not lazy).</li>
 <li>The sequencer can produce empty blocks.</li>
+<li>In lazy aggregation mode, the block manager maintains consistency with the DA layer by producing empty blocks at regular intervals, ensuring a 1:1 mapping between DA layer blocks and execution layer blocks.</li>
+<li>The lazy aggregation mechanism uses a dual timer approach:
+<ul>
+<li>A <code>blockTimer</code> that triggers block production when transactions are available</li>
+<li>A <code>lazyTimer</code> that ensures blocks are produced even during periods of inactivity</li>
+</ul>
+</li>
+<li>Empty batches are handled differently in lazy mode - instead of discarding them, they are returned with the <code>ErrNoBatch</code> error, allowing the caller to create empty blocks with proper timestamps.</li>
+<li>Transaction notifications from the <code>Reaper</code> to the <code>Manager</code> are handled via a non-blocking notification channel (<code>txNotifyCh</code>) to prevent backpressure.</li>
 <li>The block manager uses persistent storage (disk) when the <code>root_dir</code> and <code>db_path</code> configuration parameters are specified in <code>config.yaml</code> file under the app directory. If these configuration parameters are not specified, the in-memory storage is used, which will not be persistent if the node stops.</li>
 <li>The block manager does not re-apply the block again (in other words, create a new updated state and persist it) when a block was initially applied using P2P block sync, but later was DA included during DA retrieval. The block is only marked DA included in this case.</li>
 <li>The data sync store is created by prefixing <code>dataSync</code> on the main data store.</li>
 <li>The genesis <code>ChainID</code> is used to create the <code>PubSubTopID</code> in go-header with the string <code>-block</code> appended to it. This append is because the full node also has a P2P header sync running with a different P2P network. Refer to <a href="https://github.com/celestiaorg/go-header">go-header</a> specs for more details.</li>
 <li>Block sync over the P2P network works only when a full node is connected to the P2P network by specifying the initial seeds to connect to via <code>P2PConfig.Seeds</code> configuration parameter when starting the full node.</li>
 <li>Node's context is passed down to all the components of the P2P block sync to control shutting down the service either abruptly (in case of failure) or gracefully (during successful scenarios).</li>
-<li>The block manager supports the separation of header and data structures in Rollkit. This allows for expanding the sequencing scheme beyond centralized sequencing and enables the use of a decentralized sequencer mode. For detailed information on this architecture, see the <a href="specs/../../lazy-adr/adr-014-header-and-data-separation.html">Header and Data Separation ADR</a>.</li>
+<li>The block manager supports the separation of header and data structures in Rollkit. This allows for expanding the sequencing scheme beyond single sequencing and enables the use of a decentralized sequencer mode. For detailed information on this architecture, see the <a href="specs/../../lazy-adr/adr-014-header-and-data-separation.html">Header and Data Separation ADR</a>.</li>
 <li>The block manager processes blocks with a minimal header format, which is designed to eliminate dependency on CometBFT's header format and can be used to produce an execution layer tailored header if needed. For details on this header structure, see the <a href="specs/../../lazy-adr/adr-015-rollkit-minimal-header.html">Rollkit Minimal Header</a> specification.</li>
 </ul>
 <h2 id="implementation-1"><a class="header" href="#implementation-1">Implementation</a></h2>
@@ -362,6 +377,7 @@ This block is marked as soft confirmed by the validating full node until the sam
 <p>[6] <a href="specs/../../lazy-adr/adr-014-header-and-data-separation.html">Header and Data Separation ADR</a></p>
 <p>[7] <a href="specs/../../lazy-adr/adr-015-rollkit-minimal-header.html">Rollkit Minimal Header</a></p>
 <p>[8] <a href="specs/./da.html">Data Availability</a></p>
+<p>[9] <a href="specs/../../lazy-adr/adr-021-lazy-aggregation.html">Lazy Aggregation with DA Layer Consistency ADR</a></p>
 <div style="break-before: page; page-break-before: always;"></div><h1 id="block-and-header-validity"><a class="header" href="#block-and-header-validity">Block and Header Validity</a></h1>
 <h2 id="abstract-2"><a class="header" href="#abstract-2">Abstract</a></h2>
 <p>Like all blockchains, rollups are defined as the chain of <strong>valid</strong> blocks from the genesis, to the head. Thus, the block and header validity rules define the chain.</p>
@@ -440,12 +456,12 @@ Block.Verify()
 <h2 id="signedheader"><a class="header" href="#signedheader"><a href="https://github.com/rollkit/rollkit/blob/main/types/signed_header.go#L16">SignedHeader</a></a></h2>
 <div class="table-wrapper"><table><thead><tr><th><strong>Field Name</strong></th><th><strong>Valid State</strong></th><th><strong>Validation</strong></th></tr></thead><tbody>
 <tr><td>Header</td><td>Valid header for the block</td><td><code>Header</code> passes <code>ValidateBasic()</code> and <code>Verify()</code></td></tr>
-<tr><td>Signature</td><td>1 valid signature from the centralized sequencer</td><td><code>Signature</code> passes <code>ValidateBasic()</code>, with additional checks in <code>SignedHeader.ValidateBasic()</code></td></tr>
+<tr><td>Signature</td><td>1 valid signature from the single sequencer</td><td><code>Signature</code> passes <code>ValidateBasic()</code>, with additional checks in <code>SignedHeader.ValidateBasic()</code></td></tr>
 <tr><td>Validators</td><td>Array of Aggregators, must have length exactly 1.</td><td><code>Validators</code> passes <code>ValidateBasic()</code></td></tr>
 </tbody></table>
 </div>
 <h2 id="header"><a class="header" href="#header"><a href="https://github.com/rollkit/rollkit/blob/main/types/header.go#L39">Header</a></a></h2>
-<p><em><strong>Note</strong></em>: The <code>AggregatorsHash</code> and <code>NextAggregatorsHash</code> fields have been removed. Rollkit vA should ignore all Valset updates from the ABCI app, and always enforce that the proposer is the centralized sequencer set as the 1 validator in the genesis block.</p>
+<p><em><strong>Note</strong></em>: The <code>AggregatorsHash</code> and <code>NextAggregatorsHash</code> fields have been removed. Rollkit vA should ignore all Valset updates from the ABCI app, and always enforce that the proposer is the single sequencer set as the 1 validator in the genesis block.</p>
 <div class="table-wrapper"><table><thead><tr><th><strong>Field Name</strong></th><th><strong>Valid State</strong></th><th><strong>Validation</strong></th></tr></thead><tbody>
 <tr><td><strong>BaseHeader</strong> .</td><td></td><td></td></tr>
 <tr><td>Height</td><td>Height of the previous accepted header, plus 1.</td><td>checked in the `Verify()`` step</td></tr>
@@ -568,10 +584,10 @@ Block.Verify()
 <p>[4] <a href="https://github.com/celestiaorg/go-header">go-header</a></p>
 <div style="break-before: page; page-break-before: always;"></div><h1 id="header-and-data-separation-adr"><a class="header" href="#header-and-data-separation-adr">Header and Data Separation ADR</a></h1>
 <h2 id="abstract-5"><a class="header" href="#abstract-5">Abstract</a></h2>
-<p>The separation of header and data structures in Rollkit unlocks expanding the sequencing scheme beyond centralized sequencing and unlocks the use of a decentralized sequencer mode. This means that the creation of list of the transactions can be done by another network as well while rollup nodes still produce headers after executing that list of transactions. This overall change is akin to the proposer-builder separation in the Ethereum protocol, where the Rollkit header producer acts as the proposer, and the sequencer, which produces a list of transactions, acts as the builder.</p>
+<p>The separation of header and data structures in Rollkit unlocks expanding the sequencing scheme beyond single sequencing and unlocks the use of a decentralized sequencer mode. This means that the creation of list of the transactions can be done by another network as well while rollup nodes still produce headers after executing that list of transactions. This overall change is akin to the proposer-builder separation in the Ethereum protocol, where the Rollkit header producer acts as the proposer, and the sequencer, which produces a list of transactions, acts as the builder.</p>
 <h3 id="before-separation"><a class="header" href="#before-separation">Before Separation</a></h3>
 <pre><code class="language-mermaid">flowchart LR
-    CS[Centralized Sequencer] --&gt;|Creates| B[Block]
+    CS[Single Sequencer] --&gt;|Creates| B[Block]
     B --&gt;|Contains| SH1[SignedHeader]
     B --&gt;|Contains| D1[Data]
 
@@ -586,7 +602,7 @@ Block.Verify()
     class HP,SEQ,SH2,D2 node
 </code></pre>
 <h2 id="protocolcomponent-description-2"><a class="header" href="#protocolcomponent-description-2">Protocol/Component Description</a></h2>
-<p>Before, Rollkit only supported the use of a centralized sequencer that was responsible for creating a list of rollup tx by reaping its mempool, executing them to produce a header, and putting them together in a rollup block. Rollkit headers and data were encapsulated within a single block structure. The block struct looked like this:</p>
+<p>Before, Rollkit only supported the use of a single sequencer that was responsible for creating a list of rollup tx by reaping its mempool, executing them to produce a header, and putting them together in a rollup block. Rollkit headers and data were encapsulated within a single block structure. The block struct looked like this:</p>
 <pre><code class="language-go">// Block defines the structure of Rollkit block.
 type Block struct {
 	SignedHeader SignedHeader
@@ -624,7 +640,7 @@ type Block struct {
     Block *-- Data
     SignedHeader *-- Header
 </code></pre>
-<p>This change also affects how rollup full nodes sync. Previously, rollup full nodes would apply the transactions from the <code>Block</code> struct and verify that the <code>header</code> in <code>SignedHeader</code> matched their locally produced header. Now, with the separation, full nodes obtain the transaction data separately (via the DA layer directly in based sequencer mode, or via p2p gossip/DA layer in centralized sequencer mode) and verify it against the header signed by the header producer once they have both components. If a full node receives the header/data via a p2p gossip layer, they should wait to see the same header/data on the DA layer before marking the corresponding block as finalized in their view.</p>
+<p>This change also affects how rollup full nodes sync. Previously, rollup full nodes would apply the transactions from the <code>Block</code> struct and verify that the <code>header</code> in <code>SignedHeader</code> matched their locally produced header. Now, with the separation, full nodes obtain the transaction data separately (via the DA layer directly in based sequencer mode, or via p2p gossip/DA layer in single sequencer mode) and verify it against the header signed by the header producer once they have both components. If a full node receives the header/data via a p2p gossip layer, they should wait to see the same header/data on the DA layer before marking the corresponding block as finalized in their view.</p>
 <p>This ensures that the data integrity and consistency are maintained across the network.</p>
 <pre><code class="language-go">// SignedHeader struct consists of the header and a signature
 type SignedHeader struct {
@@ -657,7 +673,7 @@ type Data struct {
 	Txs Txs // List of transactions to be executed
 }
 </code></pre>
-<p>The <code>publishBlock</code> method in <code>manager.go</code> now creates the header and data structures separately. This decoupling allows for the header to be submitted to the DA layer independently of the rollup block data, which can be built by a separate network. This change supports the transition from a centralized sequencer mode to a decentralized sequencer mode, making the system more modular.</p>
+<p>The <code>publishBlock</code> method in <code>manager.go</code> now creates the header and data structures separately. This decoupling allows for the header to be submitted to the DA layer independently of the rollup block data, which can be built by a separate network. This change supports the transition from a single sequencer mode to a decentralized sequencer mode, making the system more modular.</p>
 <h2 id="message-structurecommunication-format-3"><a class="header" href="#message-structurecommunication-format-3">Message Structure/Communication Format</a></h2>
 <h3 id="header-producer"><a class="header" href="#header-producer">Header Producer</a></h3>
 <p>Before the separation: Only the entire <code>Block</code> struct composed of both header and data was submitted to the DA layer. The <code>Block</code> and <code>SignedHeader</code> were both gossipped over two separate p2p layers: gossipping <code>Block</code> to just full nodes and gossipping the <code>SignedHeader</code> to full nodes and future rollup light nodes to join that will only sync headers (and proofs).</p>
@@ -666,16 +682,16 @@ type Data struct {
 <h3 id="before-separation-1"><a class="header" href="#before-separation-1">Before Separation</a></h3>
 <pre><code class="language-mermaid">flowchart LR
 
-    CS1[Centralized Sequencer] --&gt;|Submits Block| DA1[DA Layer]
+    CS1[Single Sequencer] --&gt;|Submits Block| DA1[DA Layer]
     CS1 --&gt;|Gossips Block| FN1[Full Nodes]
     CS1 --&gt;|Gossips SignedHeader| LN1[Light Nodes]
 
     class CS1,DA1,FN1,LN1 node
 </code></pre>
-<h3 id="after-separation---centralized-mode"><a class="header" href="#after-separation---centralized-mode">After Separation - Centralized Mode</a></h3>
+<h3 id="after-separation---single-sequencer-mode"><a class="header" href="#after-separation---single-sequencer-mode">After Separation - Single Sequencer Mode</a></h3>
 <pre><code class="language-mermaid">flowchart LR
 
-    CS2[Centralized Sequencer] --&gt;|Submits Data| DA2[DA Layer]
+    CS2[Single Sequencer] --&gt;|Submits Data| DA2[DA Layer]
     HP2[Header Producer] --&gt;|Submits SignedHeader| DA2
 
     CS2 --&gt;|Gossips Data| FN2[Full Nodes]
@@ -712,7 +728,7 @@ type Data struct {
     FN-&gt;&gt;FN: Verify locally produced header matches received Header
     FN-&gt;&gt;FN: Mark block as finalized
 </code></pre>
-<p>In a centralized sequencer mode, before, a full node marks a block finalized, it should verify that both the <code>SignedHeader</code> and <code>Data</code> associated to it were made available on the DA layer by checking it directly or verifying DA inclusion proofs.</p>
+<p>In a single sequencer mode, before, a full node marks a block finalized, it should verify that both the <code>SignedHeader</code> and <code>Data</code> associated to it were made available on the DA layer by checking it directly or verifying DA inclusion proofs.</p>
 <p>In based sequencing mode, blocks can be instantly finalized since the <code>Data</code> is directly always derived from the DA layer and already exists there. There's no need for a <code>SignedHeader</code> to exist on the DA layer.</p>
 <pre><code class="language-mermaid">sequenceDiagram
     participant DA as DA Layer
@@ -735,7 +751,7 @@ type Data struct {
 <li>Ensure that all components interacting with headers and data are updated to handle them as separate entities.</li>
 <li>Security measures should be in place to prevent unauthorized access or tampering with headers and data during transmission and storage.</li>
 <li>Performance optimizations may be necessary to handle the increased complexity of managing separate header and data structures, especially in high-throughput environments.</li>
-<li>Testing and validation processes should be updated to account for the new structure and ensure that all components function correctly in both centralized and decentralized sequencer modes.</li>
+<li>Testing and validation processes should be updated to account for the new structure and ensure that all components function correctly in both single and decentralized sequencer modes.</li>
 </ul>
 <h2 id="implementation-5"><a class="header" href="#implementation-5">Implementation</a></h2>
 <p>The implementation of this separation can be found in the Rollkit repository, specifically in the changes made to the <code>manager.go</code> file. The <code>publishBlock</code> method illustrates the creation of separate header and data structures, and the associated logic for handling them independently. See <a href="https://github.com/rollkit/rollkit/pull/1789">Rollkit PR #1789</a></p>
@@ -790,7 +806,7 @@ type Header struct {
     ExtraData []byte
 }
 </code></pre>
-<p>In case the rollup has a specific designated proposer or a proposer set, that information can be put in the <code>extraData</code> field. So in centralized sequencer mode, the <code>sequencerAddress</code> can live in <code>extraData</code>. For base sequencer mode, this information is not relevant.</p>
+<p>In case the rollup has a specific designated proposer or a proposer set, that information can be put in the <code>extraData</code> field. So in single sequencer mode, the <code>sequencerAddress</code> can live in <code>extraData</code>. For base sequencer mode, this information is not relevant.</p>
 <p>This minimal Rollkit header can be transformed to be tailored to a specific execution layer as well by inserting additional information typically needed.</p>
 <h3 id="evm-execution-client"><a class="header" href="#evm-execution-client">EVM execution client</a></h3>
 <ul>
